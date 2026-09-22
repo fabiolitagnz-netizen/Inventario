@@ -1,5 +1,6 @@
+
 const express = require("express");
-const mysql = require("mysql");
+const mysql = require("mysql2"); // Se recomienda mysql2 en lugar de mysql
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const QRCode = require("qrcode");
@@ -11,33 +12,25 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
 
-// ⚠️ En producción esto debe salir de una variable de entorno
-// (process.env.JWT_SECRET), nunca quedar escrito en el código.
-const SECRET = "clave_secreta_inventario";
+const app = express();
 
-// Carpeta donde se guardan los QR generados.
+// --- CONFIGURACIÓN DE ENTORNO ---
+const PORT = process.env.PORT || 3000;
+const SECRET = process.env.JWT_SECRET || "clave_secreta_inventario";
+
+app.use(bodyParser.json());
+app.use(cors());
+
+// --- CARPETAS (Gestión de persistencia) ---
 const CARPETA_QR = path.join(__dirname, "codigos_qr");
-if (!fs.existsSync(CARPETA_QR)) {
-  fs.mkdirSync(CARPETA_QR, { recursive: true });
-}
-
-// Carpeta donde se guardan temporalmente los PDF de reportes exportados.
 const CARPETA_REPORTES = path.join(__dirname, "reportes_exportados");
-if (!fs.existsSync(CARPETA_REPORTES)) {
-  fs.mkdirSync(CARPETA_REPORTES, { recursive: true });
-}
-
-// Carpeta donde se guardan las fotos de materiales subidas.
 const CARPETA_UPLOADS = path.join(__dirname, "uploads");
-if (!fs.existsSync(CARPETA_UPLOADS)) {
-  fs.mkdirSync(CARPETA_UPLOADS, { recursive: true });
-}
 
-// Guardamos las fotos con su extensión original (ej. .jpg, .png) y un
-// nombre único, para poder mostrarlas después con Image.network() en
-// Flutter. En la base de datos solo se guarda el NOMBRE del archivo
-// (ej. "material_1699999999.jpg"), nunca la ruta completa del disco,
-// porque esa ruta cambia según el sistema operativo/servidor.
+[CARPETA_QR, CARPETA_REPORTES, CARPETA_UPLOADS].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+// --- STORAGE MULTER ---
 const storageMateriales = multer.diskStorage({
   destination: (req, file, cb) => cb(null, CARPETA_UPLOADS),
   filename: (req, file, cb) => {
@@ -47,89 +40,73 @@ const storageMateriales = multer.diskStorage({
 });
 const upload = multer({ storage: storageMateriales });
 
-const app = express();
-app.use(bodyParser.json());
-app.use(cors());
-
-// ---------------------------------------------------------------------------
-// LOGGING DE DEPURACIÓN (nuevo)
-// ---------------------------------------------------------------------------
-// Registra CADA petición que llega al servidor, con método y ruta exacta.
-// Esto es clave para diagnosticar un 404 "misterioso": si al tocar
-// "Guardar cambios" en la app NO aparece una línea aquí, la petición nunca
-// llegó a este proceso (problema de IP/puerto/otro servidor corriendo en
-// el 3000), y el bug no está en este archivo.
+// --- LOGGING ---
 app.use((req, res, next) => {
-  const hora = new Date().toLocaleTimeString();
-  console.log(`[${hora}] ${req.method} ${req.originalUrl}`);
+  console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-// Sirve las fotos subidas como archivos estáticos, ej:
-// http://<ip>:3000/uploads/material_1699999999.jpg
 app.use("/uploads", express.static(CARPETA_UPLOADS));
 
+// --- CONEXIÓN A BASE DE DATOS (Ajustada para Railway) ---
 const conexion = mysql.createConnection({
-  host: "localhost",
-  user: "root",
-  password: "",
-  database: "inventario_db"
+  host: process.env.MYSQLHOST || "localhost",
+  port: process.env.MYSQLPORT || 3306,
+  user: process.env.MYSQLUSER || "root",
+  password: process.env.MYSQLPASSWORD || "",
+  database: process.env.MYSQLDATABASE || "inventario_db"
 });
-
 conexion.connect(err => {
-  if (err) throw err;
-  console.log("Conectado a MariaDB (XAMPP)");
+  if (err) {
+    console.error("Error conectando a BD:", err);
+  } else {
+    console.log("Conectado a la base de datos MySQL");
+  }
 });
 
-app.get("/", (req, res) => {
-  res.send("Bienvenido a Inventario API");
-});
+// --- MIDDLEWARES DE SEGURIDAD ---
+function verificarToken(req, res, next) {
+  const header = req.headers["authorization"];
+  const token = header && header.split(" ")[1];
+  if (!token) return res.status(401).json({ status: "fail", mensaje: "Token no proporcionado" });
+
+  jwt.verify(token, SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ status: "fail", mensaje: "Token inválido" });
+    req.usuario = decoded;
+    next();
+  });
+}
+
+function soloAdmin(req, res, next) {
+  if (req.usuario?.rol !== "admin") {
+    return res.status(403).json({ status: "fail", mensaje: "Acceso solo para administradores" });
+  }
+  next();
+}
 
 // ---------------------------------------------------------------------------
 // AUTENTICACIÓN (registro / login con bcrypt + JWT)
 // ---------------------------------------------------------------------------
+app.get("/", (req, res) => res.send("Bienvenido a Inventario API (Producción)"));
 
 app.post("/registro", (req, res) => {
   const { nombre, correo, password, rol } = req.body;
-
-  if (!nombre || !correo || !password) {
-    return res.json({ status: "fail", mensaje: "Faltan datos del usuario" });
-  }
-
   const hashedPassword = bcrypt.hashSync(password, 8);
   const sql = "INSERT INTO usuarios (nombre, correo, password, rol) VALUES (?, ?, ?, ?)";
   conexion.query(sql, [nombre, correo, hashedPassword, rol || "maestro"], (err, result) => {
-    if (err) return res.json({ status: "error", mensaje: err });
+    if (err) return res.json({ status: "error", mensaje: "El correo ya existe" });
     res.json({ status: "ok", mensaje: "Usuario registrado" });
   });
 });
 
 app.post("/login", (req, res) => {
   const { correo, password } = req.body;
-
-  if (!correo || !password) {
-    return res.json({ status: "fail", mensaje: "Faltan credenciales" });
-  }
-
   const sql = "SELECT * FROM usuarios WHERE correo = ?";
   conexion.query(sql, [correo], (err, result) => {
-    if (err || result.length === 0) {
-      return res.json({ status: "error", mensaje: "Usuario no encontrado" });
-    }
-
+    if (err || result.length === 0) return res.json({ status: "error", mensaje: "Usuario no encontrado" });
     const usuario = result[0];
-    const passwordValido = bcrypt.compareSync(password, usuario.password);
-    if (!passwordValido) {
-      return res.json({ status: "error", mensaje: "Contraseña incorrecta" });
-    }
-
-    // Se firma también el nombre para poder usarlo luego como "maestro"
-    // sin tener que confiar en lo que mande el cliente en el body.
-    const token = jwt.sign(
-      { id: usuario.id, rol: usuario.rol, nombre: usuario.nombre },
-      SECRET,
-      { expiresIn: "1h" }
-    );
+    if (!bcrypt.compareSync(password, usuario.password)) return res.json({ status: "error", mensaje: "Contraseña incorrecta" });
+    const token = jwt.sign({ id: usuario.id, rol: usuario.rol, nombre: usuario.nombre }, SECRET, { expiresIn: "8h" });
     res.json({ status: "ok", token, rol: usuario.rol });
   });
 });
@@ -806,14 +783,10 @@ app.get("/dashboard", (req, res) => {
 // obvio si el problema es de ruta (typo, IP vieja, servidor no reiniciado)
 // en vez de un simple "Error del servidor: 404" sin contexto en la app.
 app.use((req, res) => {
-  console.log(`404 -> ${req.method} ${req.originalUrl} no coincide con ninguna ruta registrada`);
-  res.status(404).json({
-    status: "error",
-    mensaje: `Ruta no encontrada: ${req.method} ${req.originalUrl}`
-  });
+  res.status(404).json({ status: "error", mensaje: "Ruta no encontrada" });
 });
 
-app.listen(3000, () => {
-  console.log("Servidor en http://localhost:3000");
-  console.log("Los códigos QR se guardan en: " + CARPETA_QR);
+// --- INICIO DEL SERVIDOR ---
+app.listen(PORT, () => {
+  console.log(`Servidor corriendo en el puerto ${PORT}`);
 });
